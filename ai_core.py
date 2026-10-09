@@ -1,175 +1,197 @@
-"""Gemini tabanlı sınav ve öğrenci listesi görsel işlemleri."""
+"""Claude tabanlı sınav kâğıdı, cevap anahtarı ve sınıf listesi okuma.
 
+Bütün işlevler önceden hazırlanmış JPEG sayfa baytları alır (bkz. gorsel.py)
+ve (sonuç sözlüğü, kullanım sözlüğü) döndürür.
+"""
+
+import base64
 import json
-import logging
 import os
-import re
-from io import BytesIO
-from typing import Any
 
+import anthropic
 from dotenv import load_dotenv
-from google import genai
-from PIL import Image, UnidentifiedImageError
+
+from gorsel import sayfa_boyutu
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+VARSAYILAN_MODEL = "claude-haiku-4-5"
+# 1 milyon token başına USD (girdi, çıktı); tahmini maliyet gösterimi için.
+FIYATLAR = {
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-opus-5-5": (4.0, 20.0),
+}
+MAKS_CIKTI = 16000
 
 
-def _api_hata_kodu(exc):
-    """Google GenAI hata nesnelerinden HTTP durum kodunu çıkar."""
-    for attribute in ("status_code", "code"):
-        value = getattr(exc, attribute, None)
-        try:
-            if value is not None and 100 <= int(value) <= 599:
-                return int(value)
-        except (TypeError, ValueError):
-            pass
-    match = re.search(r"\b(429|500|502|503|504)\b", str(exc))
-    return int(match.group(1)) if match else None
+class AIHatasi(RuntimeError):
+    """Kullanıcıya gösterilebilir AI hatası."""
 
 
-def _model_istegi(client, model, contents, config):
-    """Önce ana modeli kullan; geçici sunucu yoğunluğunda yedek modeli dene."""
+def model_adi():
+    return os.getenv("CLAUDE_MODEL", "").strip() or VARSAYILAN_MODEL
+
+
+def api_anahtari_var_mi():
+    return bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+
+
+def _istemci():
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise AIHatasi("ANTHROPIC_API_KEY bulunamadı. Claude API anahtarını .env dosyasına ekleyip uygulamayı yeniden başlatın.")
+    # SDK 429 ve 5xx hatalarını artan beklemeyle kendiliğinden yeniden dener.
+    return anthropic.Anthropic(api_key=api_key, max_retries=3, timeout=180.0)
+
+
+def _gorsel_blogu(image_bytes):
+    return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                        "data": base64.standard_b64encode(image_bytes).decode("ascii")}}
+
+
+def _sayfa_bloklari(pages, baslik):
+    """Her sayfayı numarası ve piksel boyutuyla birlikte içerik bloklarına çevir."""
+    blocks = []
+    for number, page in enumerate(pages, start=1):
+        width, height = sayfa_boyutu(page)
+        blocks.append({"type": "text", "text": f"{baslik} — sayfa {number} ({width}x{height} piksel):"})
+        blocks.append(_gorsel_blogu(page))
+    return blocks
+
+
+def _kullanim(response, model):
+    usage = response.usage
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    input_price, output_price = FIYATLAR.get(model, FIYATLAR[VARSAYILAN_MODEL])
+    cost = (usage.input_tokens * input_price + cache_write * input_price * 1.25
+            + cache_read * input_price * 0.1 + usage.output_tokens * output_price) / 1_000_000
+    return {"model": model, "input_tokens": usage.input_tokens + cache_write + cache_read,
+            "output_tokens": usage.output_tokens, "maliyet_usd": round(cost, 6)}
+
+
+def _json_iste(system, content, schema):
+    """Claude'dan şemaya uygun JSON iste; (veri, kullanım) döndür."""
+    model = model_adi()
+    output_config = {"format": {"type": "json_schema", "schema": schema}}
+    if not model.startswith("claude-haiku"):
+        # Haiku dışındaki modellerde düşünme açıktır; maliyeti effort belirler.
+        output_config["effort"] = os.getenv("CLAUDE_EFFORT", "").strip() or "low"
     try:
-        return client.models.generate_content(model=model, contents=contents, config=config)
-    except Exception as primary_error:
-        status = _api_hata_kodu(primary_error)
-        fallback = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.7-flash").strip()
-        if status not in (500, 502, 503, 504) or not fallback or fallback == model:
-            raise
+        response = _istemci().messages.create(
+            model=model, max_tokens=MAKS_CIKTI, system=system,
+            messages=[{"role": "user", "content": content}], output_config=output_config,
+        )
+    except anthropic.AuthenticationError as exc:
+        raise AIHatasi("Claude API anahtarı geçersiz. .env dosyasındaki ANTHROPIC_API_KEY değerini kontrol edin.") from exc
+    except anthropic.PermissionDeniedError as exc:
+        raise AIHatasi(f"API anahtarınızın '{model}' modeline erişim izni yok.") from exc
+    except anthropic.NotFoundError as exc:
+        raise AIHatasi(f"'{model}' modeli bulunamadı. .env dosyasındaki CLAUDE_MODEL değerini kontrol edin.") from exc
+    except anthropic.RateLimitError as exc:
+        raise AIHatasi("Claude istek sınırına ulaşıldı. Bir dakika bekleyip yeniden deneyin.") from exc
+    except anthropic.BadRequestError as exc:
+        if "credit balance" in str(exc).lower():
+            raise AIHatasi("Claude hesabınızda kredi kalmadı. console.anthropic.com üzerinden kredi yükleyin.") from exc
+        raise AIHatasi(f"AI isteği reddedildi: {exc.message}") from exc
+    except anthropic.APIStatusError as exc:
+        if exc.status_code >= 500:
+            raise AIHatasi("Claude hizmeti şu anda yoğun. Biraz bekleyip yeniden deneyin; yüklediğiniz sayfalar korunuyor.") from exc
+        raise AIHatasi(f"AI isteği başarısız oldu (HTTP {exc.status_code}): {exc.message}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise AIHatasi("Claude hizmetine ulaşılamadı. İnternet bağlantınızı kontrol edip yeniden deneyin.") from exc
 
-        logger.warning("Gemini %s geçici olarak kullanılamıyor (HTTP %s); %s deneniyor.",
-                       model, status, fallback)
-        try:
-            return client.models.generate_content(model=fallback, contents=contents, config=config)
-        except Exception as fallback_error:
-            fallback_status = _api_hata_kodu(fallback_error)
-            logger.warning("Gemini yedek modeli %s de HTTP %s ile yanıt veremedi.",
-                           fallback, fallback_status or "bilinmiyor")
-            if fallback_status in (500, 502, 503, 504):
-                raise RuntimeError(
-                    f"Gemini modelleri şu anda yanıt veremedi: ana model {model} HTTP {status}, "
-                    f"yedek model {fallback} HTTP {fallback_status}. Bu sunucu zaman aşımı/yoğunluk "
-                    "hatasıdır; API anahtarı hatasında genellikle 401/403 görülür. Biraz bekleyip "
-                    "yeniden deneyin; yüklediğiniz sayfalar korunuyor."
-                ) from fallback_error
-            raise RuntimeError(
-                "Yedek AI modeli yanıt veremedi. GEMINI_FALLBACK_MODEL ayarını ve model erişiminizi kontrol edin."
-            ) from fallback_error
+    if response.stop_reason == "refusal":
+        raise AIHatasi("AI bu içeriği değerlendirmeyi reddetti. Sayfaları kontrol edin.")
+    if response.stop_reason == "max_tokens":
+        raise AIHatasi("AI yanıtı çok uzun olduğu için yarıda kesildi. Kâğıdı daha az sayfayla yeniden deneyin.")
+    text = next((block.text for block in response.content if block.type == "text"), "")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AIHatasi("AI yanıtı geçerli JSON biçiminde değil. Yeniden deneyin.") from exc
+    if not isinstance(data, dict):
+        raise AIHatasi("AI yanıtı beklenen biçimde değil. Yeniden deneyin.")
+    return data, _kullanim(response, model)
 
-SONUC_SEMASI = {
-    "type": "OBJECT",
+
+# ------------------------------------------------------------ kâğıt okuma
+
+# Alan sırası bilinçlidir: model önce cevabı okuyup gerekçesini yazar, puanı sonra verir.
+_SONUC_SEMASI = {
+    "type": "object",
     "properties": {
         "sorular": {
-            "type": "ARRAY",
+            "type": "array",
             "items": {
-                "type": "OBJECT",
+                "type": "object",
                 "properties": {
-                    "soru_no": {"type": "INTEGER"},
-                    "soru_ozeti": {"type": "STRING"},
-                    "maksimum_puan": {"type": "NUMBER"},
-                    "verilen_puan": {"type": "NUMBER"},
-                    "hatalar": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "gerekce": {"type": "STRING"},
-                    "anahtar_kontrolu": {"type": "STRING"},
-                    "guven": {"type": "NUMBER"},
+                    "soru_no": {"type": "integer"},
+                    "soru_ozeti": {"type": "string"},
+                    "ogrenci_cevabi": {"type": "string"},
+                    "dogru_cevap": {"type": "string"},
+                    "gerekce": {"type": "string"},
+                    "hatalar": {"type": "array", "items": {"type": "string"}},
+                    "maksimum_puan": {"type": "number"},
+                    "verilen_puan": {"type": "number"},
+                    "anahtar_kontrolu": {"type": "string"},
+                    "guven": {"type": "number"},
                     "isaretlemeler": {
-                        "type": "ARRAY",
+                        "type": "array",
                         "items": {
-                            "type": "OBJECT",
+                            "type": "object",
                             "properties": {
-                                "sayfa_no": {"type": "INTEGER"},
-                                "x1": {"type": "NUMBER"},
-                                "y1": {"type": "NUMBER"},
-                                "x2": {"type": "NUMBER"},
-                                "y2": {"type": "NUMBER"},
-                                "etiket": {"type": "STRING"},
+                                "sayfa_no": {"type": "integer"},
+                                "x1": {"type": "number"}, "y1": {"type": "number"},
+                                "x2": {"type": "number"}, "y2": {"type": "number"},
+                                "etiket": {"type": "string"},
                             },
                             "required": ["sayfa_no", "x1", "y1", "x2", "y2", "etiket"],
+                            "additionalProperties": False,
                         },
                     },
                 },
-                "required": [
-                    "soru_no", "soru_ozeti", "maksimum_puan", "verilen_puan",
-                    "hatalar", "gerekce", "anahtar_kontrolu", "guven", "isaretlemeler",
-                ],
+                "required": ["soru_no", "soru_ozeti", "ogrenci_cevabi", "dogru_cevap", "gerekce", "hatalar",
+                             "maksimum_puan", "verilen_puan", "anahtar_kontrolu", "guven", "isaretlemeler"],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["sorular"],
+    "additionalProperties": False,
 }
 
+_KAGIT_SISTEM = """Sen öğretmene yardımcı olan bir sınav değerlendirme asistanısın. Öğrencinin sınav \
+kâğıdı sayfalarını okur, her soruyu ayrı ayrı değerlendirir ve öğretmene puan önerirsin. Nihai puanı \
+öğretmen onaylar; görevin dürüst, kanıta dayalı ve tutarlı bir ön değerlendirme yapmaktır.
 
-def _gorselleri_ac(kaynaklar):
-    if kaynaklar is None:
-        return []
-    sources = kaynaklar if isinstance(kaynaklar, (list, tuple)) else [kaynaklar]
-    images = []
-    try:
-        for source in sources:
-            if isinstance(source, Image.Image):
-                images.append(source.copy())
-            elif isinstance(source, (bytes, bytearray)):
-                image = Image.open(BytesIO(source))
-                image.load()
-                images.append(image)
-            else:
-                image = Image.open(source)
-                image.load()
-                images.append(image)
-    except (OSError, UnidentifiedImageError, ValueError) as exc:
-        for image in images:
-            image.close()
-        raise ValueError("Görsel açılamadı; geçerli resim dosyası seçin.") from exc
-    return images
+Her soru için sırayla:
+1. soru_ozeti: Soruyu kâğıttan oku ve kısaca özetle.
+2. ogrenci_cevabi: Öğrencinin yazdığını (işlem adımlarıyla) olduğu gibi aktar. Yazmadığı bir şeyi \
+ekleme; okunmayan yerleri "[okunamadı]" diye belirt. Soru boş bırakıldıysa "Boş" yaz.
+3. dogru_cevap: Soruyu kendin bağımsız çöz ve doğru cevabı kısaca yaz.
+4. gerekce: Öğrencinin cevabını kendi çözümünle (ve verilmişse şablondaki doğru cevapla) adım adım \
+karşılaştır; nerede doğru, nerede yanlış olduğunu bir iki cümleyle söyle.
+5. hatalar: Hataları kısa, genel etiketlerle listele (ör. "işlem hatası", "işaret hatası", "eksik \
+çözüm", "kavram yanılgısı", "birim hatası", "boş"). Hata yoksa boş liste ver.
+6. maksimum_puan ve verilen_puan: Kısmi doğruları dikkate alarak, aşağıdaki ölçeğe göre tutarlı puanla \
+(soruda veya şablonda ayrı bir puanlama ölçütü yazıyorsa o geçerlidir):
+   - Yöntem ve sonuç doğru: tam puan. Yalnızca birim/gösterim eksiği varsa puanın yaklaşık %90'ı.
+   - Yöntem doğru, tek bir işlem ya da işaret hatası yüzünden sonuç yanlış: puanın yaklaşık yarısı.
+   - Doğru bir başlangıç var ama çözüm yarım veya birden fazla hata var: puanın yaklaşık dörtte biri.
+   - Yöntem tamamen yanlış, ilgisiz veya soru boş: 0.
+   Aynı hatayı yapan iki öğrenci aynı puanı almalı; yalnızca sonuç yanlış diye sıfır verme.
+7. anahtar_kontrolu: Şablondaki doğru cevap senin çözümünle çelişiyorsa bunu açıkça yaz; çelişki \
+yoksa boş metin ver. Şablonu otomatik olarak doğru kabul etme.
+8. guven: 0 ile 1 arasında. El yazısı okunaksızsa, soru belirsizse veya puanlama yoruma açıksa düşür.
+9. isaretlemeler: Bu sorunun sayfada kapladığı alanı (soru metni ve öğrencinin çözümünün tamamı, ilk \
+satırından son satırına kadar) tek bir dikdörtgen olarak ver. Koordinatlar o sayfanın pikselleridir: \
+sol üst köşe (0,0), x sağa, y aşağı doğru artar; x1,y1 sol üst, x2,y2 sağ alt köşedir. Soru birden \
+fazla sayfaya yayılıyorsa sayfa başına bir dikdörtgen ver. etiket "Soru N" olsun. Emin değilsen boş liste ver.
 
+Sayfalar yükleme sırasına göre numaralıdır. Yanıtın yalnızca istenen JSON olsun; metinler Türkçe olsun."""
 
-def kagit_oku(resim_yolu: Any, sorular_ve_rubrik=None, cevap_anahtari=None, max_puan=100) -> str:
-    """Öğrenci kâğıdını soru soru okur; cevap anahtarı varsa karşılaştırır.
-
-    Soru metinleri görselden okunur; önceden web formuna girilmeleri gerekmez.
-    Öğrenci kâğıdı ve cevap anahtarı tek görsel ya da sayfa listesi olabilir.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY bulunamadı. API anahtarını .env dosyasına ekleyin.")
-    if not resim_yolu:
-        raise ValueError("En az bir öğrenci sınav sayfası yükleyin.")
-
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    student_images = _gorselleri_ac(resim_yolu)
-    key_images = _gorselleri_ac(cevap_anahtari)
-    rubric = json.dumps(sorular_ve_rubrik or [], ensure_ascii=False, indent=2)
-    prompt = f"""
-Sen öğretmene yardımcı olan bir sınav değerlendirme asistanısın. Soruları ve
-öğrenci cevaplarını öğrenci kâğıdı görsellerinden kendin oku; öğretmenin soru
-metinlerini web sayfasına yazması gerekmez. Birden fazla öğrenci sayfası varsa
-yükleme sırasına göre numaralandır.
-
-TOPLAM MAKSİMUM PUAN: {max_puan}
-ÖĞRETMENİN EK ÖLÇÜTLERİ (varsa): {rubric}
-
-Her soruyu önce bağımsız biçimde kendin çöz ve öğrenci cevabını değerlendir.
-Sonra cevap anahtarı görselleri verilmişse bunları ikinci kontrol kaynağı olarak
-kullan. Anahtar hatalı görünüyorsa bunu anahtar_kontrolu alanında yaz; anahtarı
-otomatik olarak doğru kabul etme. Anahtar ve öğrenci sayfaları farklı görsel
-gruplarıdır. İşaretleme koordinatları yalnızca öğrenci sayfalarına göredir.
-
-Kurallar:
-- Her soruyu numaralandır ve kısa soru_ozeti yaz.
-- Sayfada soru başına puan ağırlığı belirtilmişse onu kullan. Belirtilmemişse
-  toplam maksimum puanı sorular arasında makul dağıt; maksimum_puan değerlerinin
-  toplamı {max_puan} puanı geçmesin.
-- İşlem adımlarını ve kısmi doğru cevapları dikkate al; öğrenci cevabını uydurma.
-- Okunmayan veya belirsiz cevaplarda gerekçede bunu söyle ve guven değerini düşür.
-- Hatalar alanında kısa etiketler kullan; hata yoksa boş liste ver.
-- Her soru için kanıta dayalı kısa gerekçe, varsa anahtarla farkı ve 0-1 güven ver.
-- isaretlemeler, yalnızca öğrenci kâğıdındaki cevap bölgesini yaklaşık gösterir.
-  x1,y1,x2,y2 koordinatları sayfa ölçüsüne oranlı 0-1 aralığındadır; emin değilsen boş liste ver.
-- Bu bir öğretmen önerisidir; nihai puanı öğretmen onaylar.
-- Yalnızca tanımlı JSON şemasında yanıt ver.
-"""
 
     contents = []
     if key_images:
