@@ -1,158 +1,146 @@
-"""SınavMatik öğretmen paneli."""
+"""SınavMatik öğretmen paneli: giriş, oturum ve sayfa gezinmesi."""
 
-from io import BytesIO
-import json
-import uuid
+import os
+from html import escape
 
-import altair as alt
-import pandas as pd
 import streamlit as st
-from PIL import Image, ImageDraw
+import streamlit.components.v1 as components
 
-from ai_core import kagit_oku, ogrenci_listesi_oku
 from data_handler import (
-    ai_sonucu_kontrol_fonksiyonu,
-    ogretmen_girisini_dogrula,
-    ogretmen_hesabi_getir,
-    ogretmen_kaydi_olustur,
-    ogretmen_tercihlerini_guncelle,
-    ogretmen_veritabani_yolu,
-    sayfa_gorsellerini_getir,
-    sinav_ekle,
-    sinavlari_getir,
-    sinif_ekle,
-    siniflari_getir,
-    sinif_ogrenci_listesi_kaydet,
-    ogrencileri_getir,
-    ogrenci_ekle,
-    sonuc_kaydet,
-    sonuclari_getir,
-    soru_istatistikleri,
+    OTURUM_SURESI_GUN,
+    kullanici_dogrula,
+    kullanici_olustur,
+    oturum_kullanicisi,
+    oturum_olustur,
+    oturum_sil,
     veritabani_hazirla,
 )
+from ui import ortak
+from ui.stil import stili_uygula
+from views import analiz, ayarlar, degerlendir, genel_bakis, siniflar, sinavlar
 
+CEREZ = "sinavmatik_oturum"
+_ASSETS = os.path.join(os.path.dirname(__file__), "assets")
 
-st.set_page_config(page_title="SınavMatik", page_icon="📝", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="S\u0131navMatik", page_icon=os.path.join(_ASSETS, "icon.svg"), layout="wide")
 veritabani_hazirla()
-if st.session_state.get("teacher_user_id"):
-    for auth_key in ("login_password", "register_password"):
-        st.session_state.pop(auth_key, None)
-SUBJECTS = ["Matematik", "Biyoloji", "Kimya", "Türkçe", "Tarih", "Fizik", "İngilizce", "Diğer"]
-ACCENTS = {
-    "Adaçayı": ("#087f6b", "#e8f5f0"), "Okyanus": ("#426b9a", "#eaf1f8"),
-    "Erik": ("#795a91", "#f1ebf5"), "Kiremit": ("#b76d52", "#f8eee9"),
-    "Zeytin": ("#72803a", "#f0f2e7"), "Grafit": ("#58666b", "#edf0f0"),
-}
-SUBJECT_DESIGNS = {
-    "Matematik": {"mark": "∑   π   √", "description": "Formüller ve sayılar", "designs": ["Formül Defteri", "Geometri Izgarası"], "pattern": "radial-gradient(circle at 88% 5%, #dcefe8 0, transparent 28%), linear-gradient(90deg, #087f6b08 1px, transparent 1px), linear-gradient(#087f6b08 1px, transparent 1px), #f8f8f4", "pattern_alt": "radial-gradient(circle at 92% 8%, #e2efe9 0, transparent 28%), radial-gradient(#087f6b12 1px, transparent 1px), #f8f8f4"},
-    "Biyoloji": {"mark": "DNA   ·   Hücre   ·   Yaşam", "description": "Canlı sistemler", "designs": ["Canlı Sistemler", "Hücre Atlası"], "pattern": "radial-gradient(ellipse at 94% 0%, #e3f1df 0, transparent 30%), radial-gradient(ellipse at 70% 7%, #087f6b08 0, transparent 22%), #f8f8f4", "pattern_alt": "radial-gradient(circle at 92% 5%, #e6f1df 0, transparent 26%), repeating-linear-gradient(120deg, #72803a08 0, #72803a08 1px, transparent 1px, transparent 48px), #f8f8f4"},
-    "Kimya": {"mark": "H₂O   ·   NaCl   ·   pH", "description": "Moleküller ve tepkimeler", "designs": ["Molekül Notları", "Periyodik Düzen"], "pattern": "radial-gradient(circle at 90% 8%, #f4e7d6 0, transparent 28%), radial-gradient(circle at 84% 10%, #b76d520c 1px, transparent 2px), #f8f8f4", "pattern_alt": "radial-gradient(circle at 92% 4%, #f2e9dc 0, transparent 26%), linear-gradient(90deg, #b76d5209 1px, transparent 1px), linear-gradient(#b76d5209 1px, transparent 1px), #f8f8f4"},
-    "Türkçe": {"mark": "Aa   ·   Sözcük   ·   Metin", "description": "Dil ve anlatım", "designs": ["Metin Atölyesi", "Edebiyat Defteri"], "pattern": "linear-gradient(90deg, #795a9108 1px, transparent 1px), linear-gradient(180deg, #f0eaf4 0, transparent 30%), #f8f8f4", "pattern_alt": "linear-gradient(180deg, #f0eaf4 0, transparent 30%), repeating-linear-gradient(0deg, #795a9108 0, #795a9108 1px, transparent 1px, transparent 42px), #f8f8f4"},
-    "Tarih": {"mark": "MÖ   ·   MS   ·   Zaman", "description": "Dönemler ve kaynaklar", "designs": ["Zaman Çizgisi", "Arşiv Notları"], "pattern": "linear-gradient(180deg, #f4eadb 0, transparent 32%), repeating-linear-gradient(0deg, #b76d5208 0, #b76d5208 1px, transparent 1px, transparent 42px), #faf8f3", "pattern_alt": "radial-gradient(ellipse at 90% 0%, #f4eadb 0, transparent 30%), linear-gradient(90deg, #b76d5208 1px, transparent 1px), #faf8f3"},
-    "Fizik": {"mark": "F = ma   ·   λ   ·   Δ", "description": "Kuvvet ve hareket", "designs": ["Vektör Alanı", "Dalga Laboratuvarı"], "pattern": "radial-gradient(circle at 88% 8%, #e3eafa 0, transparent 28%), radial-gradient(#426b9a10 1px, transparent 1px), #f8f8f4", "pattern_alt": "radial-gradient(ellipse at 92% 0%, #e3eafa 0, transparent 28%), repeating-linear-gradient(0deg, #426b9a08 0, #426b9a08 1px, transparent 1px, transparent 44px), #f8f8f4"},
-    "İngilizce": {"mark": "Aa   ·   Sözcük   ·   Anlam", "description": "Dil ve kelime dağarcığı", "designs": ["Dil Atölyesi", "Kelime Haritası"], "pattern": "linear-gradient(180deg, #e8eef8 0, transparent 32%), repeating-linear-gradient(90deg, #426b9a08 0, #426b9a08 1px, transparent 1px, transparent 54px), #f8f8f4", "pattern_alt": "radial-gradient(ellipse at 90% 0%, #e8eef8 0, transparent 30%), repeating-linear-gradient(0deg, #426b9a08 0, #426b9a08 1px, transparent 1px, transparent 42px), #f8f8f4"},
-    "Diğer": {"mark": "Ders   ·   Plan   ·   Gelişim", "description": "Öğretmen çalışma alanı", "designs": ["Sade Çalışma Alanı", "Planlama Panosu"], "pattern": "radial-gradient(ellipse at 90% 0%, #e9f4ee 0, transparent 34%), #f8f8f4", "pattern_alt": "linear-gradient(90deg, #087f6b08 1px, transparent 1px), linear-gradient(180deg, #e9f4ee 0, transparent 34%), #f8f8f4"},
-}
-# Renkli branş temaları; klasik arayüz bu paletleri kullanmaz.
-DESIGN_PALETTES = {
-    "Matematik": [("#D5F1E5", "#B7E5D1", "#176B58", "#74C6A6"), ("#DCE5FF", "#C2D1FF", "#354F9D", "#7F98EA")],
-    "Biyoloji": [("#DDF0C7", "#C6E5A7", "#3D7438", "#8FBE61"), ("#CDEBDD", "#AEE0C8", "#176B55", "#59B68A")],
-    "Kimya": [("#FFE7C5", "#FFD391", "#A4561F", "#E49A4E"), ("#CFEAF4", "#A9DCEA", "#226B83", "#60AEC4")],
-    "Türkçe": [("#F1D8EA", "#E6BFE0", "#874D79", "#C47DB5"), ("#FFE1D4", "#FFC8B5", "#A65342", "#D97A61")],
-    "Tarih": [("#F2E0BC", "#E9CF98", "#88602D", "#C4933F"), ("#EAE0CC", "#DCC8A7", "#705333", "#AA895D")],
-    "Fizik": [("#D6E2FF", "#BDD0FF", "#3459A4", "#7894E0"), ("#CDEBFA", "#A9DDF3", "#176B93", "#55A9D1")],
-    "İngilizce": [("#DED9FF", "#C9C2FB", "#5C519C", "#9085DD"), ("#D0EAF2", "#AFDDE9", "#286D85", "#65ACBD")],
-    "Diğer": [("#D2EBE1", "#B8DFD0", "#286D5A", "#70BDA3"), ("#DCE5F7", "#C6D3EF", "#4A5F91", "#8298CB")],
-}
+stili_uygula()
 
 
-def arayuz_temasi(subject, design):
-    info = SUBJECT_DESIGNS.get(subject, SUBJECT_DESIGNS["Diğer"])
-    if design not in info["designs"]:
-        return None
-    index = info["designs"].index(design)
-    wash, panel, deep, border = DESIGN_PALETTES.get(subject, DESIGN_PALETTES["Diğer"])[index]
-    pattern = (
-        f"radial-gradient(ellipse at 92% 2%, {panel} 0, transparent 35%), "
-        f"linear-gradient(135deg, {wash} 0%, #fbfcfa 56%, #f8f8f4 100%)"
+def _cerez_yaz(token):
+    """Oturum çerezini tarayıcıya yaz (boş token çerezi siler)."""
+    max_age = OTURUM_SURESI_GUN * 86400 if token else 0
+    components.html(
+        f"<script>window.parent.document.cookie = '{CEREZ}={token}; path=/; max-age={max_age}; SameSite=Lax';</script>",
+        height=0,
     )
-    return {"wash": wash, "panel": panel, "deep": deep, "border": border, "pattern": pattern}
 
 
-CLASSIC_DESIGN = "Klasik SınavMatik"
+def _giris_ekrani():
+    _, center, _ = st.columns([0.3, 1.4, 0.3])
+    with center:
+        st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
+        info, form = st.columns([1, 1], gap="large", vertical_alignment="center")
+        with info:
+            st.markdown("""
+            <div class="login-panel">
+              <div>
+                <div class="login-brand">S&#305;navMatik</div>
+                <div class="login-title">Sınav kâğıtlarını daha hızlı değerlendirin.</div>
+                <ul class="login-list">
+                  <li>Kâğıtların fotoğrafını veya PDF'ini yükleyin</li>
+                  <li>Her soru için puan önerisini ve gerekçesini görün</li>
+                  <li>Puanları kontrol edip onaylayın</li>
+                  <li>Sınıfın hangi sorularda zorlandığını inceleyin</li>
+                </ul>
+              </div>
+              <div class="login-foot">Son karar her zaman öğretmenindir.</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with form:
+            st.markdown("## Hoş geldiniz")
+            st.caption("Devam etmek için giriş yapın veya yeni hesap oluşturun.")
+            login_tab, signup_tab = st.tabs(["Giriş yap", "Hesap oluştur"])
+            with login_tab:
+                with st.form("login_form", border=False):
+                    email = st.text_input("E-posta", placeholder="ornek@okul.com")
+                    password = st.text_input("Şifre", type="password")
+                    submitted = st.form_submit_button("Giriş yap", type="primary", use_container_width=True)
+                if submitted:
+                    user, error = kullanici_dogrula(email, password)
+                    if user:
+                        st.session_state["authenticated_user"] = user
+                        st.session_state["oturum_token"] = oturum_olustur(user["id"])
+                        st.session_state["cerez_bekliyor"] = True
+                        st.rerun()
+                    st.error(error)
+            with signup_tab:
+                with st.form("signup_form", border=False):
+                    full_name = st.text_input("Ad soyad")
+                    signup_email = st.text_input("E-posta", placeholder="ornek@okul.com", key="signup_email")
+                    signup_password = st.text_input("Şifre", type="password", placeholder="En az 8 karakter", key="signup_password")
+                    signup_confirm = st.text_input("Şifre (tekrar)", type="password")
+                    signup_submitted = st.form_submit_button("Hesap oluştur", type="primary", use_container_width=True)
+                if signup_submitted:
+                    if signup_password != signup_confirm:
+                        st.error("Şifreler eşleşmiyor.")
+                    else:
+                        created, message = kullanici_olustur(signup_email, full_name, signup_password)
+                        (st.success if created else st.error)(message)
+            st.caption("Her hesap yalnızca kendi sınıflarını ve sınavlarını görür.")
 
 
-def kayitli_tercihleri_yaz():
-    teacher_id = st.session_state.get("teacher_user_id")
-    if teacher_id:
-        subject = st.session_state.get("teacher_subject", "Diğer")
-        available_designs = [CLASSIC_DESIGN] + SUBJECT_DESIGNS.get(subject, SUBJECT_DESIGNS["Diğer"])["designs"]
-        if st.session_state.get("teacher_ui_choice") not in available_designs:
-            st.session_state["teacher_ui_choice"] = CLASSIC_DESIGN
-        ogretmen_tercihlerini_guncelle(
-            teacher_id, subject,
-            st.session_state.get("teacher_ui_choice", CLASSIC_DESIGN),
-            st.session_state.get("teacher_accent", "Adaçayı"),
-        )
+# ------------------------------------------------------------------ oturum
+if st.session_state.pop("cikis_yapildi", False):
+    _cerez_yaz("")
+elif st.session_state.get("authenticated_user") is None:
+    # Sayfa yenilendiğinde oturumu tarayıcı çerezinden geri yükle.
+    token = st.context.cookies.get(CEREZ)
+    restored = oturum_kullanicisi(token)
+    if restored:
+        st.session_state["authenticated_user"] = restored
+        st.session_state["oturum_token"] = token
+
+user = st.session_state.get("authenticated_user")
+if user is None:
+    st.navigation([st.Page(_giris_ekrani, title="Giriş", url_path="giris", default=True)], position="hidden").run()
+    st.stop()
+
+if st.session_state.pop("cerez_bekliyor", False):
+    _cerez_yaz(st.session_state["oturum_token"])
 
 
-def oturum_ac(account):
-    st.session_state["teacher_user_id"] = account["id"]
-    st.session_state["teacher_subject"] = account["subject"]
-    st.session_state["teacher_ui_choice"] = account["ui_choice"]
-    st.session_state["teacher_accent"] = account["accent"]
-    st.session_state["teacher_name"] = account["full_name"]
-    st.session_state["teacher_db_path"] = ogretmen_veritabani_yolu(account["id"])
-    st.rerun()
+# ----------------------------------------------------------------- gezinme
+def _sayfa(module, title, icon, url_path, default=False):
+    def goster():
+        module.goster(user)
+    return st.Page(goster, title=title, icon=icon, url_path=url_path, default=default)
 
 
-teacher_id = st.session_state.get("teacher_user_id")
-profile = ogretmen_hesabi_getir(teacher_id) if teacher_id else None
-if profile and profile["subject"] == "İngilizce" and profile["ui_choice"] in ("Language Studio", "Word Atlas"):
-    translated_design = {"Language Studio": "Dil Atölyesi", "Word Atlas": "Kelime Haritası"}[profile["ui_choice"]]
-    ogretmen_tercihlerini_guncelle(teacher_id, profile["subject"], translated_design, profile["accent"])
-    profile = ogretmen_hesabi_getir(teacher_id)
-if teacher_id and profile is None:
-    for key in ("teacher_user_id", "teacher_name", "teacher_db_path"):
+ortak.sayaci_sifirla()
+ortak.SAYFALAR.clear()
+ortak.SAYFALAR.update({
+    "Genel Bakış": _sayfa(genel_bakis, "Genel Bakış", ":material/home:", "genel-bakis", default=True),
+    "Sınıflar": _sayfa(siniflar, "Sınıflar", ":material/groups:", "siniflar"),
+    "Sınavlar": _sayfa(sinavlar, "Sınavlar", ":material/assignment:", "sinavlar"),
+    "Kâğıt Değerlendir": _sayfa(degerlendir, "Kâğıt Değerlendir", ":material/fact_check:", "degerlendir"),
+    "Analizler": _sayfa(analiz, "Analizler", ":material/bar_chart:", "analizler"),
+    "Ayarlar": _sayfa(ayarlar, "Ayarlar", ":material/settings:", "ayarlar"),
+})
+
+st.logo(os.path.join(_ASSETS, "logo.svg"), size="large")
+page = st.navigation(list(ortak.SAYFALAR.values()))
+
+# Kenar çubuğundan başka sayfaya geçilince açık detay görünümlerini kapat.
+by_git = st.session_state.pop("_gecis", False)
+if st.session_state.get("_sayfa") != page.title and not by_git:
+    for key in ortak.DETAY_ANAHTARLARI:
         st.session_state.pop(key, None)
-    teacher_id = None
-if not teacher_id:
-    auth_subject = st.session_state.get("register_subject", SUBJECTS[0])
-    auth_info = SUBJECT_DESIGNS[auth_subject]
-    auth_design = st.session_state.get(f"register_design_{auth_subject}", CLASSIC_DESIGN)
-    auth_accent_name = st.session_state.get("register_accent", "Adaçayı")
-    auth_accent, auth_pale = ACCENTS.get(auth_accent_name, ACCENTS["Adaçayı"])
-    auth_theme = arayuz_temasi(auth_subject, auth_design)
-    auth_background = "radial-gradient(ellipse at 88% 4%, #e3f2e9 0, transparent 34%), #f8f8f4"
-    auth_wash, auth_deep, auth_border = auth_pale, auth_accent, f"{auth_accent}30"
-    if auth_theme:
-        auth_background = auth_theme["pattern"]
-        auth_wash, auth_deep, auth_border = auth_theme["wash"], auth_theme["deep"], auth_theme["border"]
-    st.markdown(f"""
-    <style>
-    #MainMenu, [data-testid="stMainMenu"] {{ visibility:hidden !important; }}
-    .stAppDeployButton {{ display:none !important; }}
-    :root {{ --ink:#19312d; --muted:#71827d; --green:{auth_accent}; --pale:{auth_pale}; --line:#e5ece8; }}
-    .stApp {{ background:{auth_background}; }}
-    .main .block-container {{ max-width:1050px; padding-top:4rem; }}
-    .auth-hero {{ padding:30px 28px; border-radius:20px; background:linear-gradient(145deg,{auth_wash},#fbfcfa); border:1px solid {auth_border}; min-height:330px; }}
-    .auth-mark {{ display:inline-block; padding:8px 12px; border-radius:10px; background:#fff; color:{auth_deep}; font-weight:700; letter-spacing:.05em; }}
-    .auth-note {{ color:#71827d; line-height:1.7; }}
-    div[data-testid="stVerticalBlockBorderWrapper"] {{ background:rgba(255,255,255,.92); border:1px solid var(--line); border-radius:16px; box-shadow:0 8px 24px #17352d0a; }}
-    button[data-testid="stBaseButton-primary"] {{ background:{auth_accent}; border-color:{auth_accent}; border-radius:10px; }}
-    [data-baseweb="radio"] input:checked + div {{ border-color:{auth_accent} !important; background-color:{auth_accent} !important; }}
-    div[data-baseweb="select"]:focus-within > div {{ border-color:{auth_accent} !important; box-shadow:0 0 0 1px {auth_accent} !important; }}
-    </style>
-    """, unsafe_allow_html=True)
-    hero, form_col = st.columns([1.05, 1], gap="large", vertical_alignment="center")
-    with hero:
-        st.markdown(f"""
-        <div class="auth-hero">
-          <span class="auth-mark">SınavMatik</span>
-          <div style="height:34px"></div>
-          <div style="font-size:38px;font-weight:700;line-height:1.15;color:#19312d">Öğretmenler için<br>akıllı değerlendirme.</div>
-          <p class="auth-note">Sınavlarını düzenle, AI önerilerini incele ve son kararı kendin ver.</p>
-          <div style="height:14px"></div>
+st.session_state["_sayfa"] = page.title
+
+st.markdown("<div class='foot-note'>Öğrenci bilgileri ve kâğıt görselleri bu bilgisayardaki veritabanında saklanır. "
+            "Değerlendirme sırasında kâğıt görselleri Claude API'ye gönderilir.</div>", unsafe_allow_html=True)
+
           <div style="display:inline-flex;gap:10px;align-items:center;margin-top:12px;padding:10px 14px;border-radius:10px;background:{auth_theme['panel'] if auth_theme else auth_pale};color:{auth_deep};font-size:13px;font-weight:700;letter-spacing:.04em">{auth_info['mark']}</div>
           <p class="auth-note" style="margin-top:14px">{auth_subject} · {auth_design}</p>
         </div>
