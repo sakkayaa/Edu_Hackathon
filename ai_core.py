@@ -193,91 +193,115 @@ fazla sayfaya yayılıyorsa sayfa başına bir dikdörtgen ver. etiket "Soru N" 
 Sayfalar yükleme sırasına göre numaralıdır. Yanıtın yalnızca istenen JSON olsun; metinler Türkçe olsun."""
 
 
-    contents = []
-    if key_images:
-        contents.extend(["CEVAP ANAHTARI SAYFALARI:", *key_images])
-    contents.extend(["ÖĞRENCİ SINAV KÂĞIDI SAYFALARI:", *student_images, prompt])
-    try:
-        client = genai.Client(api_key=api_key)
-        response = _model_istegi(
-            client, model, contents,
-            {"response_mime_type": "application/json", "response_schema": SONUC_SEMASI},
+
+def kagit_oku(sayfalar, sorular=None, max_puan=100):
+    """Öğrenci kâğıdını soru soru değerlendir.
+
+    sorular: sınavın kayıtlı soru şablonu (soru_no, soru_ozeti, maksimum_puan,
+    dogru_cevap). Boşsa soru yapısı ve puan dağılımı kâğıttan okunur.
+    """
+    if not sayfalar:
+        raise ValueError("En az bir öğrenci sınav sayfası yükleyin.")
+    if sorular:
+        template = json.dumps(sorular, ensure_ascii=False, sort_keys=True)
+        rules = (
+            "SINAVIN SORU ŞABLONU (öğretmen tarafından onaylandı):\n" + template + "\n\n"
+            "Tam olarak bu soru numaralarını değerlendir ve maksimum_puan değerlerini şablondan aynen al. "
+            "Öğrenci bir soruyu hiç cevaplamadıysa o soruya 0 ver ve hatalar listesine \"boş\" yaz."
         )
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        status = _api_hata_kodu(exc)
-        if status in (500, 502, 503, 504):
-            raise RuntimeError(
-                "Gemini hizmeti şu anda yoğun veya geçici olarak erişilemiyor. Biraz bekleyip yeniden deneyin."
-            ) from exc
-        raise RuntimeError(f"AI değerlendirmesi alınamadı: {exc}") from exc
-    finally:
-        for image in student_images + key_images:
-            image.close()
-
-    text = getattr(response, "text", None)
-    if not text:
-        raise RuntimeError("AI boş yanıt verdi. Sayfaları ve anahtarı kontrol edip tekrar deneyin.")
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("AI yanıtı geçerli JSON biçiminde değil.") from exc
-    if not isinstance(result, dict) or not isinstance(result.get("sorular"), list):
-        raise RuntimeError("AI yanıtında beklenen 'sorular' listesi bulunamadı.")
-    return json.dumps(result, ensure_ascii=False)
+    else:
+        rules = (
+            f"Bu sınav için kayıtlı soru şablonu yok. Soruları kâğıttan oku. SINAVIN TOPLAM PUANI: {max_puan:g}. "
+            "Kâğıtta soru başına puan yazıyorsa onu kullan; yazmıyorsa toplam puanı sorulara zorluklarına göre "
+            f"dağıt. maksimum_puan değerlerinin toplamı tam olarak {max_puan:g} olsun."
+        )
+    # Şablon öğrenciden öğrenciye değişmez; önbellek noktası sınav boyunca tekrar kullanılır.
+    content = [{"type": "text", "text": rules, "cache_control": {"type": "ephemeral"}}]
+    content += _sayfa_bloklari(sayfalar, "ÖĞRENCİ KÂĞIDI")
+    content.append({"type": "text", "text": "Yukarıdaki öğrenci kâğıdını soru soru değerlendir."})
+    data, usage = _json_iste(_KAGIT_SISTEM, content, _SONUC_SEMASI)
+    if not isinstance(data.get("sorular"), list):
+        raise AIHatasi("AI yanıtında beklenen 'sorular' listesi bulunamadı.")
+    return data, usage
 
 
-def ogrenci_listesi_oku(resim_yolu: Any) -> str:
-    """Sınıf listesi görselinden öğrenci numarası ve adlarını JSON olarak çıkar."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY bulunamadı. API anahtarını .env dosyasına ekleyin.")
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    image_list = _gorselleri_ac(resim_yolu)
-    if not image_list:
-        raise ValueError("Bir sınıf listesi fotoğrafı yükleyin.")
-    image = image_list[0]
-    schema = {
-        "type": "OBJECT",
-        "properties": {
-            "ogrenciler": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {"student_id": {"type": "STRING"}, "name": {"type": "STRING"}, "guven": {"type": "NUMBER"}},
-                    "required": ["student_id", "name", "guven"],
+# -------------------------------------------------------- soru şablonu
+
+_SABLON_SEMASI = {
+    "type": "object",
+    "properties": {
+        "sorular": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "soru_no": {"type": "integer"},
+                    "soru_ozeti": {"type": "string"},
+                    "dogru_cevap": {"type": "string"},
+                    "maksimum_puan": {"type": "number"},
                 },
-            }
-        },
-        "required": ["ogrenciler"],
-    }
-    prompt = """Bu görseldeki sınıf listesini oku. Her satırdan öğrenci numarası ve tam adı çıkar.
-Yalnızca açıkça okunabilen bilgileri yaz; okunmayan bilgiyi tahmin etme.
-Numarayı baştaki sıfırları koruyarak metin olarak döndür. 0-1 arası güven ver.
-Yalnızca istenen JSON biçiminde yanıt ver."""
-    try:
-        client = genai.Client(api_key=api_key)
-        response = _model_istegi(client, model, [image, prompt],
-            {"response_mime_type": "application/json", "response_schema": schema})
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        status = _api_hata_kodu(exc)
-        if status in (500, 502, 503, 504):
-            raise RuntimeError(
-                "Gemini hizmeti şu anda yoğun veya geçici olarak erişilemiyor. Biraz bekleyip yeniden deneyin."
-            ) from exc
-        raise RuntimeError(f"Sınıf listesi okunamadı: {exc}") from exc
-    finally:
-        for page in image_list:
-            page.close()
-    if not getattr(response, "text", None):
-        raise RuntimeError("AI sınıf listesi için boş yanıt verdi.")
-    try:
-        parsed = json.loads(response.text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("AI'nin sınıf listesi yanıtı geçerli JSON değil.") from exc
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("ogrenciler"), list):
-        raise RuntimeError("AI yanıtında öğrenci listesi bulunamadı.")
-    return json.dumps(parsed, ensure_ascii=False)
+                "required": ["soru_no", "soru_ozeti", "dogru_cevap", "maksimum_puan"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["sorular"],
+    "additionalProperties": False,
+}
+
+_SABLON_SISTEM = """Sen bir sınavın soru şablonunu çıkaran asistansın. Sana bir sınavın cevap anahtarı \
+veya boş soru kâğıdı verilir. Her soru için soru numarasını, sorunun kısa özetini, doğru cevabı \
+(çözümün kilit adımlarıyla, kısa) ve maksimum puanı çıkar. Her soruyu önce kendin çöz. Sayfada cevap \
+yazmıyorsa kendi çözümünü yaz. Sayfadaki cevap senin çözümünle çelişiyorsa doğru_cevap alanına kendi \
+çözümünü yaz ve başına "[Anahtardaki cevap farklı: ...; kontrol edin]" notunu ekle. Sayfada soru puanı yazıyorsa onu kullan; yazmıyorsa toplam puanı sorulara zorluklarına göre dağıt. \
+Yanıtın yalnızca istenen JSON olsun; metinler Türkçe olsun."""
+
+
+def sablon_cikar(sayfalar, max_puan=100):
+    """Cevap anahtarı veya boş soru kâğıdından sınavın soru şablonunu çıkar."""
+    if not sayfalar:
+        raise ValueError("En az bir cevap anahtarı sayfası yükleyin.")
+    content = _sayfa_bloklari(sayfalar, "CEVAP ANAHTARI / SORU KÂĞIDI")
+    content.append({"type": "text", "text": f"SINAVIN TOPLAM PUANI: {max_puan:g}. maksimum_puan değerlerinin "
+                                            f"toplamı tam olarak {max_puan:g} olsun. Soru şablonunu çıkar."})
+    data, usage = _json_iste(_SABLON_SISTEM, content, _SABLON_SEMASI)
+    if not isinstance(data.get("sorular"), list) or not data["sorular"]:
+        raise AIHatasi("AI bu sayfalardan soru çıkaramadı. Daha net bir görsel deneyin.")
+    return data, usage
+
+
+# -------------------------------------------------------- sınıf listesi
+
+_LISTE_SEMASI = {
+    "type": "object",
+    "properties": {
+        "ogrenciler": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"student_id": {"type": "string"}, "name": {"type": "string"},
+                               "guven": {"type": "number"}},
+                "required": ["student_id", "name", "guven"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["ogrenciler"],
+    "additionalProperties": False,
+}
+
+_LISTE_SISTEM = """Sana bir sınıf listesinin fotoğrafı verilir. Her satırdan öğrenci numarasını ve tam \
+adını çıkar. Yalnızca açıkça okunabilen bilgileri yaz; okunmayan bilgiyi tahmin etme. Numarayı baştaki \
+sıfırları koruyarak metin olarak döndür. Her satır için 0-1 arası güven ver. Yanıtın yalnızca istenen JSON olsun."""
+
+
+def ogrenci_listesi_oku(sayfalar):
+    """Sınıf listesi görsel(ler)inden öğrenci numarası ve adlarını çıkar."""
+    if not sayfalar:
+        raise ValueError("Bir sınıf listesi fotoğrafı yükleyin.")
+    content = _sayfa_bloklari(sayfalar, "SINIF LİSTESİ")
+    content.append({"type": "text", "text": "Listedeki bütün öğrencileri çıkar."})
+    data, usage = _json_iste(_LISTE_SISTEM, content, _LISTE_SEMASI)
+    if not isinstance(data.get("ogrenciler"), list):
+        raise AIHatasi("AI yanıtında öğrenci listesi bulunamadı.")
+    return data, usage
