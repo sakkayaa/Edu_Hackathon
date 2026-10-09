@@ -1,233 +1,234 @@
-"""AI grading validation and teacher-approved class analytics."""
+"""SQLite tabanlı hesap, sınıf, sınav ve sonuç işlemleri.
 
-from __future__ import annotations
+Bütün sınıf/sınav/sonuç işlevleri `owner_id` alır; bir öğretmen yalnızca
+kendi verisini görür ve değiştirir.
+"""
 
-from collections import defaultdict
-from copy import deepcopy
-from math import isfinite
-from typing import Any, Mapping, Sequence
-
-
-class VeriDogrulamaHatasi(ValueError):
-    """Raised when rubric, AI output, or reviewed results are invalid."""
-
-
-def _records(value: Any, label: str = "Soru listesi") -> list[Mapping[str, Any]]:
-    if isinstance(value, Mapping):
-        value = value.get("sorular")
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
-        raise VeriDogrulamaHatasi(f"{label} boş veya geçersiz.")
-    if any(not isinstance(item, Mapping) for item in value):
-        raise VeriDogrulamaHatasi(f"{label} içindeki kayıtlar nesne olmalı.")
-    return list(value)
+import hashlib
+import hmac
+import json
+import math
+import os
+import secrets
+import sqlite3
+from datetime import datetime, timedelta, timezone
 
 
-def _number(value: Any, label: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
-        raise VeriDogrulamaHatasi(f"{label} sonlu bir sayı olmalı.")
-    return float(value)
+DB_PATH = os.getenv("SINAVMATIK_DB", os.path.join(os.path.dirname(__file__), "sinavmatik.db"))
+SEMA_SURUMU = 2
+OTURUM_SURESI_GUN = 14
+GIRIS_DENEME_SINIRI = 5
+GIRIS_KILIT_DAKIKA = 15
+
+_SEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    display_name TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS login_attempts (
+    email TEXT NOT NULL COLLATE NOCASE,
+    attempted_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS classes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course TEXT NOT NULL,
+    class_name TEXT NOT NULL,
+    UNIQUE(owner_id, course, class_name)
+);
+CREATE TABLE IF NOT EXISTS students (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    student_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    UNIQUE(class_id, student_id)
+);
+CREATE TABLE IF NOT EXISTS exams (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    course TEXT NOT NULL,
+    class_name TEXT NOT NULL,
+    exam_type TEXT NOT NULL DEFAULT 'Sınav',
+    questions_json TEXT NOT NULL,
+    total_points REAL NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exam_key_pages (
+    exam_id INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+    page_no INTEGER NOT NULL,
+    image BLOB NOT NULL,
+    PRIMARY KEY(exam_id, page_no)
+);
+CREATE TABLE IF NOT EXISTS results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exam_id INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+    student_id TEXT NOT NULL,
+    student_name TEXT NOT NULL DEFAULT '',
+    scores_json TEXT NOT NULL,
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    approved INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    UNIQUE(exam_id, student_id)
+);
+CREATE TABLE IF NOT EXISTS result_pages (
+    result_id INTEGER NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+    page_no INTEGER NOT NULL,
+    image BLOB NOT NULL,
+    PRIMARY KEY(result_id, page_no)
+);
+CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    islem TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0
+);
+"""
 
 
-def ai_yanitini_dogrula(
-    ai_yaniti: Mapping[str, Any],
-    sorular_ve_rubrik: Sequence[Mapping[str, Any]] | Mapping[str, Any],
-    *,
-    guven_esigi: float = 0.70,
-) -> dict[str, Any]:
-    """Validate ``ai_core.kagit_oku`` output against the exam rubric."""
-    threshold = _number(guven_esigi, "Güven eşiği")
-    if not 0 <= threshold <= 1:
-        raise VeriDogrulamaHatasi("Güven eşiği 0 ile 1 arasında olmalı.")
-
-    rubric_records = _records(sorular_ve_rubrik, "Rubrik")
-    ai_records = _records(ai_yaniti, "AI yanıtı")
-    rubric: dict[int, Mapping[str, Any]] = {}
-    for index, question in enumerate(rubric_records, start=1):
-        number = question.get("soru_no")
-        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-            raise VeriDogrulamaHatasi(f"Rubrikteki {index}. soru numarası geçersiz.")
-        if number in rubric:
-            raise VeriDogrulamaHatasi(f"Rubrikte {number}. soru tekrarlanıyor.")
-        maximum = _number(question.get("maksimum_puan"), f"{number}. soru maksimum puanı")
-        if maximum <= 0 or not question.get("rubrik"):
-            raise VeriDogrulamaHatasi(f"{number}. sorunun maksimum puanı veya rubriği eksik.")
-        rubric[number] = question
-
-    received: dict[int, dict[str, Any]] = {}
-    for index, item in enumerate(ai_records, start=1):
-        number = item.get("soru_no")
-        if isinstance(number, bool) or not isinstance(number, int):
-            raise VeriDogrulamaHatasi(f"AI yanıtındaki {index}. soru numarası geçersiz.")
-        if number not in rubric:
-            raise VeriDogrulamaHatasi(f"AI yanıtında rubrikte olmayan {number}. soru var.")
-        if number in received:
-            raise VeriDogrulamaHatasi(f"AI yanıtında {number}. soru tekrarlanıyor.")
-
-        maximum = _number(rubric[number]["maksimum_puan"], f"{number}. soru maksimum puanı")
-        if _number(item.get("maksimum_puan"), f"{number}. AI maksimum puanı") != maximum:
-            raise VeriDogrulamaHatasi(f"{number}. sorunun maksimum puanı rubrikle uyuşmuyor.")
-        score = _number(item.get("verilen_puan"), f"{number}. soru puanı")
-        if not 0 <= score <= maximum:
-            raise VeriDogrulamaHatasi(f"{number}. soru puanı 0 ile {maximum:g} arasında olmalı.")
-        confidence = _number(item.get("guven"), f"{number}. soru güven değeri")
-        if not 0 <= confidence <= 1:
-            raise VeriDogrulamaHatasi(f"{number}. soru güven değeri 0 ile 1 arasında olmalı.")
-        mistakes = item.get("hatalar")
-        reason = item.get("gerekce")
-        if not isinstance(mistakes, list) or any(not isinstance(error, str) for error in mistakes):
-            raise VeriDogrulamaHatasi(f"{number}. sorunun hataları metin listesi olmalı.")
-        if not isinstance(reason, str) or not reason.strip():
-            raise VeriDogrulamaHatasi(f"{number}. sorunun gerekçesi boş olamaz.")
-
-        received[number] = {
-            "soru_no": number,
-            "maksimum_puan": rubric[number]["maksimum_puan"],
-            "verilen_puan": item["verilen_puan"],
-            "hatalar": list(mistakes),
-            "gerekce": reason.strip(),
-            "guven": confidence,
-            "ogretmen_kontrolu_gerekli": (
-                confidence < threshold or item.get("ogretmen_kontrolu_gerekli") is True
-            ),
-        }
-
-    missing = [number for number in rubric if number not in received]
-    if missing:
-        raise VeriDogrulamaHatasi("AI yanıtında eksik sorular var: " + ", ".join(map(str, missing)))
-    return {"sorular": [received[number] for number in rubric]}
+def _simdi():
+    return datetime.now(timezone.utc)
 
 
-def ogretmen_duzenle(
-    ai_sonucu: Mapping[str, Any],
-    duzenlemeler: Mapping[int, Mapping[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Create an unapproved review record, preserving AI and teacher scores separately."""
-    if not isinstance(ai_sonucu, Mapping):
-        raise VeriDogrulamaHatasi("AI sonucu nesne biçiminde olmalı.")
-    edits = duzenlemeler or {}
-    if not isinstance(edits, Mapping):
-        raise VeriDogrulamaHatasi("Düzenlemeler soru numarasına göre nesne olmalı.")
-
-    reviewed = []
-    seen: set[int] = set()
-    for item in _records(ai_sonucu, "AI sonucu"):
-        number = item.get("soru_no")
-        if isinstance(number, bool) or not isinstance(number, int) or number in seen:
-            raise VeriDogrulamaHatasi("AI sonucundaki soru numarası geçersiz veya tekrarlı.")
-        seen.add(number)
-        maximum = _number(item.get("maksimum_puan"), f"{number}. soru maksimum puanı")
-        ai_score = _number(item.get("verilen_puan"), f"{number}. AI puanı")
-        edit = edits.get(number, {})
-        if not isinstance(edit, Mapping):
-            raise VeriDogrulamaHatasi(f"{number}. soru düzenlemesi geçersiz.")
-        teacher_score = _number(edit.get("ogretmen_puani", ai_score), f"{number}. öğretmen puanı")
-        if maximum <= 0 or not 0 <= ai_score <= maximum or not 0 <= teacher_score <= maximum:
-            raise VeriDogrulamaHatasi(f"{number}. soru puanı maksimum puan sınırları dışında.")
-        mistakes = edit.get("hatalar", item.get("hatalar", []))
-        reason = edit.get("gerekce", item.get("gerekce", ""))
-        if not isinstance(mistakes, list) or any(not isinstance(error, str) for error in mistakes):
-            raise VeriDogrulamaHatasi(f"{number}. sorunun hataları metin listesi olmalı.")
-        if not isinstance(reason, str) or not reason.strip():
-            raise VeriDogrulamaHatasi(f"{number}. sorunun gerekçesi boş olamaz.")
-        reviewed.append({
-            "soru_no": number,
-            "maksimum_puan": item["maksimum_puan"],
-            "ai_puani": item["verilen_puan"],
-            "ogretmen_puani": teacher_score,
-            "hatalar": list(mistakes),
-            "gerekce": reason.strip(),
-            "guven": item.get("guven"),
-            "ogretmen_kontrolu_gerekli": item.get("ogretmen_kontrolu_gerekli", False),
-        })
-    return {"ogretmen_onayli": False, "sorular": reviewed}
+def _connect(db_path=None):
+    connection = sqlite3.connect(db_path or DB_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
 
 
-def ogretmen_onayla(duzenlenmis_sonuc: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate and mark teacher-reviewed results as approved."""
-    if not isinstance(duzenlenmis_sonuc, Mapping):
-        raise VeriDogrulamaHatasi("Onaylanacak değerlendirme geçersiz.")
-    result = deepcopy(dict(duzenlenmis_sonuc))
-    for question in _records(result, "Onaylanacak değerlendirme"):
-        number = question.get("soru_no")
-        maximum = _number(question.get("maksimum_puan"), f"{number}. soru maksimum puanı")
-        score = _number(question.get("ogretmen_puani"), f"{number}. öğretmen puanı")
-        if maximum <= 0 or not 0 <= score <= maximum:
-            raise VeriDogrulamaHatasi(f"{number}. sorunun öğretmen puanı geçersiz.")
-        if not isinstance(question.get("hatalar"), list) or not isinstance(question.get("gerekce"), str):
-            raise VeriDogrulamaHatasi(f"{number}. sorunun öğretmen kontrolü tamamlanmamış.")
-    result["ogretmen_onayli"] = True
-    return result
+def _sutunlar(conn, table):
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def sinif_sonuclarini_dogrula(
-    sonuclar: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return a deep-copied class result collection with valid approval states."""
-    if not isinstance(sonuclar, Sequence) or isinstance(sonuclar, (str, bytes)):
-        raise VeriDogrulamaHatasi("Sınıf sonuçları liste biçiminde olmalı.")
-    normalized = []
-    for index, result in enumerate(sonuclar, start=1):
-        if not isinstance(result, Mapping) or not isinstance(result.get("ogretmen_onayli"), bool):
-            raise VeriDogrulamaHatasi(f"{index}. öğrenci sonucunda onay durumu bulunamadı.")
-        item = deepcopy(dict(result))
-        _records(item, f"{index}. öğrenci sonucu")
-        normalized.append(item)
-    return normalized
+def veritabani_hazirla(db_path=None):
+    """Tabloları oluştur; eski (hesaba bağlı olmayan) veritabanını yeni şemaya taşı."""
+    conn = _connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        # İlk sürümde sınıflar hesaba bağlı değildi; tabloyu sahip sütunuyla yeniden kur.
+        if "classes" in tables and "owner_id" not in _sutunlar(conn, "classes"):
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    display_name TEXT NOT NULL, password_salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE classes_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    course TEXT NOT NULL, class_name TEXT NOT NULL,
+                    UNIQUE(owner_id, course, class_name));
+                INSERT INTO classes_v2(id, owner_id, course, class_name)
+                    SELECT id, (SELECT MIN(id) FROM users), course, class_name FROM classes
+                    WHERE (SELECT MIN(id) FROM users) IS NOT NULL;
+                DROP TABLE classes;
+                ALTER TABLE classes_v2 RENAME TO classes;
+                """
+            )
+        conn.executescript(_SEMA)
+        exam_columns = _sutunlar(conn, "exams")
+        if "exam_type" not in exam_columns:
+            conn.execute("ALTER TABLE exams ADD COLUMN exam_type TEXT NOT NULL DEFAULT 'Sınav'")
+        if "total_points" not in exam_columns:
+            conn.execute("ALTER TABLE exams ADD COLUMN total_points REAL NOT NULL DEFAULT 100")
+        if "owner_id" not in exam_columns:
+            conn.execute("ALTER TABLE exams ADD COLUMN owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE")
+        conn.execute("UPDATE exams SET owner_id=(SELECT MIN(id) FROM users) WHERE owner_id IS NULL")
+        if "warnings_json" not in _sutunlar(conn, "results"):
+            conn.execute("ALTER TABLE results ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'")
+        conn.execute(f"PRAGMA user_version = {SEMA_SURUMU}")
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def sinif_hata_analizi(
-    sonuclar: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Compute question error counts/percentages from approved results only.
+# ---------------------------------------------------------------- hesaplar
 
-    A question is counted as an error when the teacher-approved ``hatalar``
-    list is non-empty. Unapproved AI suggestions and teacher edits are skipped.
-    """
-    if not isinstance(sonuclar, Sequence) or isinstance(sonuclar, (str, bytes)):
-        raise VeriDogrulamaHatasi("Sınıf sonuçları liste biçiminde olmalı.")
-    totals: dict[int, dict[str, Any]] = defaultdict(
-        lambda: {"maksimum_puan": None, "ogrenci_sayisi": 0, "hata_sayisi": 0, "puan_toplami": 0.0}
-    )
-    approved_count = 0
-    for index, result in enumerate(sonuclar, start=1):
-        if not isinstance(result, Mapping):
-            raise VeriDogrulamaHatasi(f"{index}. öğrenci sonucu geçersiz.")
-        if result.get("ogretmen_onayli") is not True:
-            continue
-        approved_count += 1
-        seen: set[int] = set()
-        for question in _records(result, f"{index}. onaylı sonuç"):
-            number = question.get("soru_no")
-            if isinstance(number, bool) or not isinstance(number, int) or number < 1 or number in seen:
-                raise VeriDogrulamaHatasi("Onaylı sonuçtaki soru numarası geçersiz veya tekrarlı.")
-            seen.add(number)
-            maximum = _number(question.get("maksimum_puan"), f"{number}. soru maksimum puanı")
-            score = _number(question.get("ogretmen_puani"), f"{number}. öğretmen puanı")
-            mistakes = question.get("hatalar")
-            if maximum <= 0 or not 0 <= score <= maximum:
-                raise VeriDogrulamaHatasi(f"Onaylı {number}. soru puanı geçersiz.")
-            if not isinstance(mistakes, list) or any(not isinstance(error, str) for error in mistakes):
-                raise VeriDogrulamaHatasi(f"Onaylı {number}. sorunun hataları geçersiz.")
-            total = totals[number]
-            if total["maksimum_puan"] is not None and total["maksimum_puan"] != maximum:
-                raise VeriDogrulamaHatasi(f"{number}. sorunun maksimum puanı sonuçlarda farklı.")
-            total["maksimum_puan"] = maximum
-            total["ogrenci_sayisi"] += 1
-            total["puan_toplami"] += score
-            if mistakes:
-                total["hata_sayisi"] += 1
+def _sifre_ozeti(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600_000).hex()
 
-    question_results = []
-    for number, total in sorted(totals.items()):
-        count = total["ogrenci_sayisi"]
-        errors = total["hata_sayisi"]
-        question_results.append({
-            "soru_no": number,
-            "onayli_ogrenci_sayisi": count,
-            "hata_yapan_ogrenci_sayisi": errors,
-            "hata_yuzdesi": round(errors / count * 100, 2) if count else 0.0,
-            "maksimum_puan": total["maksimum_puan"],
-            "ortalama_puan": round(total["puan_toplami"] / count, 2) if count else 0.0,
-        })
-    return {"onayli_ogrenci_sayisi": approved_count, "sorular": question_results}
 
+def kullanici_olustur(email, display_name, password, db_path=None):
+    """Yerel hesap oluştur; şifre tuzlanmış PBKDF2 özeti olarak saklanır."""
+    email = email.strip().lower()
+    display_name = display_name.strip()
+    local, _, domain = email.partition("@")
+    if not local or "." not in domain or " " in email or not display_name:
+        return False, "Ad soyad ve geçerli bir e-posta adresi girin."
+    if len(password) < 8:
+        return False, "Şifreniz en az 8 karakter olmalı."
+    salt = secrets.token_bytes(16)
+    try:
+        with _connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO users(email, display_name, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+                (email, display_name, salt.hex(), _sifre_ozeti(password, salt), _simdi().isoformat()),
+            )
+        return True, "Hesabınız hazır. Şimdi giriş yapabilirsiniz."
+    except sqlite3.IntegrityError:
+        return False, "Bu e-posta adresiyle zaten bir hesap var."
+
+
+def kullanici_dogrula(email, password, db_path=None):
+    """Giriş bilgilerini doğrula. (kullanıcı | None, hata mesajı) döndürür."""
+    email = email.strip().lower()
+    window_start = (_simdi() - timedelta(minutes=GIRIS_KILIT_DAKIKA)).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (window_start,))
+        failed = conn.execute("SELECT COUNT(*) AS n FROM login_attempts WHERE email=?", (email,)).fetchone()["n"]
+        if failed >= GIRIS_DENEME_SINIRI:
+            return None, f"Çok fazla hatalı deneme. {GIRIS_KILIT_DAKIKA} dakika sonra yeniden deneyin."
+        user = conn.execute(
+            "SELECT id, email, display_name, password_salt, password_hash FROM users WHERE email=?", (email,)
+        ).fetchone()
+        valid = user is not None and hmac.compare_digest(
+            _sifre_ozeti(password, bytes.fromhex(user["password_salt"])), user["password_hash"])
+        if not valid:
+            conn.execute("INSERT INTO login_attempts(email, attempted_at) VALUES (?, ?)", (email, _simdi().isoformat()))
+            return None, "E-posta veya şifre hatalı."
+        conn.execute("DELETE FROM login_attempts WHERE email=?", (email,))
+    return {"id": user["id"], "email": user["email"], "display_name": user["display_name"]}, ""
+
+
+def sifre_degistir(user_id, current_password, new_password, db_path=None):
+    if len(new_password) < 8:
+        return False, "Yeni şifre en az 8 karakter olmalı."
+    with _connect(db_path) as conn:
+        user = conn.execute("SELECT password_salt, password_hash FROM users WHERE id=?", (user_id,)).fetchone()
+        if user is None or not hmac.compare_digest(
+                _sifre_ozeti(current_password, bytes.fromhex(user["password_salt"])), user["password_hash"]):
+            return False, "Mevcut şifre hatalı."
+        salt = secrets.token_bytes(16)
+        conn.execute("UPDATE users SET password_salt=?, password_hash=? WHERE id=?",
+                     (salt.hex(), _sifre_ozeti(new_password, salt), user_id))
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+    return True, "Şifreniz güncellendi."
+
+
+def _token_ozeti(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def oturum_olustur(user_id, db_path=None):
+    """Tarayıcı çerezinde tutulacak oturum anahtarı üret; veritabanında yalnızca özeti saklanır."""
+    token = secrets.token_urlsafe(32)
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at < ?", (_simdi().isoformat(),))
+        conn.execute("INSERT INTO sessions(token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                     (_token_ozeti(token), user_id, (_simdi() + timedelta(days=OTURUM_SURESI_GUN)).isoformat()))
+    return token
